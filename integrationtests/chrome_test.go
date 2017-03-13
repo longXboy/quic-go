@@ -1,16 +1,16 @@
 package integrationtests
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
+	"time"
 
-	"github.com/tebeka/selenium"
+	"github.com/knq/chromedp"
 
+	"github.com/knq/chromedp/runner"
 	"github.com/lucas-clemente/quic-go/protocol"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -18,6 +18,7 @@ import (
 
 const nImgs = 200
 const imgSize = 40
+const chromeDownloadWait = 200 * time.Millisecond
 
 func init() {
 	http.HandleFunc("/tile", func(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +43,26 @@ func init() {
 	})
 }
 
+func getChromeForVersion(ctx context.Context, version protocol.VersionNumber) *chromedp.CDP {
+	cdp, err := chromedp.New(ctx, chromedp.WithRunnerOptions(
+		runner.Flag("enable-quic", true),
+		runner.Flag("no-proxy-server", true),
+		runner.Flag("origin-to-force-quic-on", "quic.clemente.io:443"),
+		runner.Flag("host-resolver-rules",
+			fmt.Sprintf("MAP quic.clemente.io:443 localhost:%s", port)),
+		runner.Flag("quic-version", fmt.Sprintf("QUIC_VERSION_%d", version)),
+	))
+	Expect(err).NotTo(HaveOccurred())
+	return cdp
+}
+
+func navigate(ctx context.Context, chrome *chromedp.CDP, url string) {
+	err := chrome.Run(ctx, chromedp.Tasks{
+		chromedp.Navigate(url),
+	})
+	Expect(err).NotTo(HaveOccurred())
+}
+
 var _ = Describe("Chrome tests", func() {
 	// test disabled since it doesn't work with the configurable QUIC version in the server
 	PIt("does not work with mismatching versions", func() {
@@ -50,18 +71,25 @@ var _ = Describe("Chrome tests", func() {
 
 		supportedVersionsBefore := protocol.SupportedVersions
 		protocol.SupportedVersions = []protocol.VersionNumber{versionForUs}
-		wd := getWebdriverForVersion(versionForChrome)
+
+		ctx, cancelChrome := context.WithCancel(context.Background())
+		chrome := getChromeForVersion(ctx, versionForChrome)
 
 		defer func() {
 			protocol.SupportedVersions = supportedVersionsBefore
-			wd.Close()
+			err := chrome.Shutdown(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			err = chrome.Wait()
+			Expect(err).NotTo(HaveOccurred())
+			cancelChrome()
 		}()
 
-		err := wd.Get("https://quic.clemente.io/hello")
-		Expect(err).NotTo(HaveOccurred())
-		source, err := wd.PageSource()
-		Expect(err).NotTo(HaveOccurred())
-		Expect(source).ToNot(ContainSubstring("Hello, World!\n"))
+		navigate(ctx, chrome, "https://quic.clemente.io/hello")
+		Consistently(func() string {
+			res := ""
+			chrome.Run(ctx, chromedp.Tasks{chromedp.Text("body", &res)})
+			return res
+		}).ShouldNot(ContainSubstring("Hello, World!"))
 	})
 
 	for i := range protocol.SupportedVersions {
@@ -69,7 +97,9 @@ var _ = Describe("Chrome tests", func() {
 
 		Context(fmt.Sprintf("with quic version %d", version), func() {
 			var (
-				wd                      selenium.WebDriver
+				ctx                     context.Context
+				cancelChrome            context.CancelFunc
+				chrome                  *chromedp.CDP
 				supportedVersionsBefore []protocol.VersionNumber
 			)
 
@@ -79,42 +109,40 @@ var _ = Describe("Chrome tests", func() {
 				}
 				supportedVersionsBefore = protocol.SupportedVersions
 				protocol.SupportedVersions = []protocol.VersionNumber{version}
-				wd = getWebdriverForVersion(version)
+				ctx, cancelChrome = context.WithCancel(context.Background())
+				chrome = getChromeForVersion(ctx, version)
 			})
 
 			AfterEach(func() {
-				wd.Close()
+				defer cancelChrome()
+				err := chrome.Shutdown(ctx)
+				Expect(err).NotTo(HaveOccurred())
+				err = chrome.Wait()
+				Expect(err).NotTo(HaveOccurred())
 				protocol.SupportedVersions = supportedVersionsBefore
 			})
 
 			It("loads a simple hello world page using quic", func(done Done) {
-				err := wd.Get("https://quic.clemente.io/hello")
-				Expect(err).NotTo(HaveOccurred())
-				source, err := wd.PageSource()
-				Expect(err).NotTo(HaveOccurred())
-				Expect(source).To(ContainSubstring("Hello, World!\n"))
+				navigate(ctx, chrome, "https://quic.clemente.io/hello")
+				Eventually(func() string {
+					res := ""
+					err := chrome.Run(ctx, chromedp.Tasks{chromedp.Text("body", &res)})
+					Expect(err).NotTo(HaveOccurred())
+					return res
+				}).Should(ContainSubstring("Hello, World!"))
 				close(done)
 			}, 5)
 
 			It("loads a large number of files", func(done Done) {
-				err := wd.Get("https://quic.clemente.io/tiles")
-				Expect(err).NotTo(HaveOccurred())
+				expectedWidth := nImgs * imgSize
+				navigate(ctx, chrome, "https://quic.clemente.io/tiles")
 				Eventually(func() error {
-					imgs, err := wd.FindElements("tag name", "img")
-					if err != nil {
-						return err
-					}
-					if len(imgs) != nImgs {
-						return fmt.Errorf("expected number of images to be %d, got %d", nImgs, len(imgs))
-					}
-					for i, img := range imgs {
-						size, err := img.Size()
-						if err != nil {
-							return err
-						}
-						if size.Height != imgSize || size.Width != imgSize {
-							return fmt.Errorf("image %d did not have expected size", i)
-						}
+					totalWidth := []byte{}
+					chrome.Run(ctx, chromedp.Tasks{
+						chromedp.Evaluate(`var w = 0; document.querySelectorAll("img").forEach(e=> w += e.offsetWidth); w`, &totalWidth),
+					})
+					if string(totalWidth) != strconv.Itoa(expectedWidth) {
+						return fmt.Errorf("expected %d, got %s", expectedWidth, string(totalWidth))
 					}
 					return nil
 				}, 5).ShouldNot(HaveOccurred())
@@ -122,111 +150,41 @@ var _ = Describe("Chrome tests", func() {
 			}, 10)
 
 			It("downloads a small file", func() {
+				dlName := getRandomDlName()
 				dataMan.GenerateData(dataLen)
-				err := wd.Get("https://quic.clemente.io/data")
-				Expect(err).NotTo(HaveOccurred())
-				Eventually(func() int { return getDownloadSize("data") }, 30, 0.1).Should(Equal(dataLen))
-				Expect(getDownloadMD5("data")).To(Equal(dataMan.GetMD5()))
-			}, 60)
+				navigate(ctx, chrome, "https://quic.clemente.io/data/"+dlName)
+				Eventually(func() []byte { return getDownloadMD5(dlName) }, 10, 0.1).Should(Equal(dataMan.GetMD5()))
+				// To avoid Chrome's "do you want to abort the DL" window
+				time.Sleep(chromeDownloadWait)
+			}, 10)
 
 			It("downloads a large file", func() {
+				dlName := getRandomDlName()
 				dataMan.GenerateData(dataLongLen)
-				err := wd.Get("https://quic.clemente.io/data")
+				err := chrome.Run(ctx, chromedp.Tasks{
+					chromedp.Navigate("https://quic.clemente.io/data/" + dlName),
+				})
 				Expect(err).NotTo(HaveOccurred())
-				Eventually(func() int { return getDownloadSize("data") }, 90, 0.5).Should(Equal(dataLongLen))
-				Expect(getDownloadMD5("data")).To(Equal(dataMan.GetMD5()))
-			}, 100)
+				Eventually(func() int { return getDownloadSize(dlName) }, 10, 0.5).Should(Equal(dataLongLen))
+				Expect(getDownloadMD5(dlName)).To(Equal(dataMan.GetMD5()))
+				// To avoid Chrome's "do you want to abort the DL" window
+				time.Sleep(chromeDownloadWait)
+			}, 10)
 
 			It("uploads a small file", func() {
-				dataMan.GenerateData(dataLen)
-				data := dataMan.GetData()
-				dir, err := ioutil.TempDir("", "quic-upload-src")
-				Expect(err).ToNot(HaveOccurred())
-				defer os.RemoveAll(dir)
-				tmpfn := filepath.Join(dir, "data.dat")
-				err = ioutil.WriteFile(tmpfn, data, 0777)
-				Expect(err).ToNot(HaveOccurred())
-				copyFileToDocker(tmpfn)
-
-				err = wd.Get("https://quic.clemente.io/uploadform?num=1")
-				Expect(err).NotTo(HaveOccurred())
-				elem, err := wd.FindElement(selenium.ByCSSSelector, "#upload_0")
-				Expect(err).ToNot(HaveOccurred())
-				err = elem.SendKeys("/home/seluser/data.dat")
-				Expect(err).ToNot(HaveOccurred())
-				Eventually(func() error { return elem.Submit() }, 30, 0.1).ShouldNot(HaveOccurred())
-
-				file := filepath.Join(uploadDir, "data.dat")
-				Expect(getFileSize(file)).To(Equal(dataLen))
-				Expect(getFileMD5(file)).To(Equal(dataMan.GetMD5()))
+				navigate(ctx, chrome, "https://quic.clemente.io/uploadtest?num=1&len="+strconv.Itoa(dataLen))
+				Eventually(func() int32 { return nFilesUploaded }).Should(BeEquivalentTo(1))
 			})
 
 			It("uploads a large file", func() {
-				dataMan.GenerateData(dataLongLen)
-				data := dataMan.GetData()
-				dir, err := ioutil.TempDir("", "quic-upload-src")
-				Expect(err).ToNot(HaveOccurred())
-				defer os.RemoveAll(dir)
-				tmpfn := filepath.Join(dir, "data.dat")
-				err = ioutil.WriteFile(tmpfn, data, 0777)
-				Expect(err).ToNot(HaveOccurred())
-				copyFileToDocker(tmpfn)
-
-				err = wd.Get("https://quic.clemente.io/uploadform?num=1")
-				Expect(err).NotTo(HaveOccurred())
-				elem, err := wd.FindElement(selenium.ByCSSSelector, "#upload_0")
-				Expect(err).ToNot(HaveOccurred())
-				err = elem.SendKeys("/home/seluser/data.dat")
-				Expect(err).ToNot(HaveOccurred())
-				Eventually(func() error { return elem.Submit() }, 90, 0.5).ShouldNot(HaveOccurred())
-
-				file := filepath.Join(uploadDir, "data.dat")
-				Expect(getFileSize(file)).To(Equal(dataLongLen))
-				Expect(getFileMD5(file)).To(Equal(dataMan.GetMD5()))
+				navigate(ctx, chrome, "https://quic.clemente.io/uploadtest?num=1&len="+strconv.Itoa(dataLongLen))
+				Eventually(func() int32 { return nFilesUploaded }, 30).Should(BeEquivalentTo(1))
 			})
 
-			// this test takes a long time because it copies every file into the docker container one by one
-			// unfortunately, docker doesn't support copying multiple files at once
-			// see https://github.com/docker/docker/issues/7710
 			It("uploads many small files", func() {
 				num := protocol.MaxStreamsPerConnection + 20
-
-				dir, err := ioutil.TempDir("", "quic-upload-src")
-				Expect(err).ToNot(HaveOccurred())
-				defer os.RemoveAll(dir)
-
-				var md5s [][]byte
-
-				for i := 0; i < num; i++ {
-					dataMan.GenerateData(dataLen)
-					data := dataMan.GetData()
-					md5s = append(md5s, dataMan.GetMD5())
-					tmpfn := filepath.Join(dir, "data_"+strconv.Itoa(i)+".dat")
-					err = ioutil.WriteFile(tmpfn, data, 0777)
-					Expect(err).ToNot(HaveOccurred())
-					copyFileToDocker(tmpfn)
-				}
-
-				err = wd.Get("https://quic.clemente.io/uploadform?num=" + strconv.Itoa(num))
-				Expect(err).NotTo(HaveOccurred())
-
-				for i := 0; i < num; i++ {
-					var elem selenium.WebElement
-					elem, err = wd.FindElement(selenium.ByCSSSelector, "#upload_"+strconv.Itoa(i))
-					Expect(err).ToNot(HaveOccurred())
-					err = elem.SendKeys("/home/seluser/data_" + strconv.Itoa(i) + ".dat")
-					Expect(err).ToNot(HaveOccurred())
-				}
-
-				elem, err := wd.FindElement(selenium.ByCSSSelector, "#form")
-				Expect(err).ToNot(HaveOccurred())
-				Eventually(func() error { return elem.Submit() }, 30, 0.1).ShouldNot(HaveOccurred())
-
-				for i := 0; i < num; i++ {
-					file := filepath.Join(uploadDir, "data_"+strconv.Itoa(i)+".dat")
-					Expect(getFileSize(file)).To(Equal(dataLen))
-					Expect(getFileMD5(file)).To(Equal(md5s[i]))
-				}
+				navigate(ctx, chrome, "https://quic.clemente.io/uploadtest?len="+strconv.Itoa(dataLen)+"&num="+strconv.Itoa(num))
+				Eventually(func() int32 { return nFilesUploaded }, 30).Should(BeEquivalentTo(num))
 			})
 		})
 	}
