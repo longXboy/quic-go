@@ -27,6 +27,7 @@ before_install:
   - go get github.com/onsi/gomega
   - export GOARCH=$TRAVIS_GOARCH
   - go env # for debugging
+  - chromium-browser --version
   - "export DISPLAY=:99.0"
   - "Xvfb $DISPLAY &"
 

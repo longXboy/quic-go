@@ -2,7 +2,6 @@ package integrationtests
 
 import (
 	"bytes"
-	"crypto/md5"
 	"flag"
 	"fmt"
 	"io"
@@ -14,7 +13,6 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	"strconv"
 
@@ -29,18 +27,16 @@ import (
 )
 
 const (
-	dataLen      = 500 * 1024       // 500 KB
-	dataLongLen  = 50 * 1024 * 1024 // 50 MB
-	dlDataPrefix = "quic-go_dl_test_"
+	dataLen     = 500 * 1024       // 500 KB
+	dataLongLen = 50 * 1024 * 1024 // 50 MB
 )
 
 var (
-	server         *h2quic.Server
-	dataMan        dataManager
-	port           string
-	downloadDir    string
-	clientPath     string // path of the quic_client
-	serverPath     string // path of the quic_server
+	server     *h2quic.Server
+	dataMan    dataManager
+	port       string
+	clientPath string // path of the quic_client
+	serverPath string // path of the quic_server
 
 	logFileName string // the log file set in the ginkgo flags
 	logFile     *os.File
@@ -56,8 +52,6 @@ func TestIntegration(t *testing.T) {
 var _ = BeforeSuite(func() {
 	setupHTTPHandlers()
 	setupQuicServer()
-
-	downloadDir = os.Getenv("HOME") + "/Downloads/"
 })
 
 var _ = AfterSuite(func() {
@@ -91,15 +85,6 @@ var _ = BeforeEach(func() {
 })
 
 var _ = AfterEach(func() {
-	removeDownloadData()
-	if len(uploadDir) < 20 {
-		panic("uploadDir too short")
-	}
-	os.RemoveAll(uploadDir)
-
-	// remove downloaded file in docker container
-	removeDownload("data")
-
 	if len(logFileName) > 0 {
 		_ = logFile.Close()
 	}
@@ -122,11 +107,13 @@ func setupHTTPHandlers() {
 		Expect(err).NotTo(HaveOccurred())
 	})
 
-	http.HandleFunc("/data/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/prdata", func(w http.ResponseWriter, r *http.Request) {
 		defer GinkgoRecover()
-		data := dataMan.GetData()
-		Expect(data).ToNot(HaveLen(0))
-		_, err := w.Write(data)
+		sl := r.URL.Query().Get("len")
+		l, err := strconv.Atoi(sl)
+		Expect(err).NotTo(HaveOccurred())
+		data := generatePRData(l)
+		_, err = w.Write(data)
 		Expect(err).NotTo(HaveOccurred())
 	})
 
@@ -138,10 +125,20 @@ func setupHTTPHandlers() {
 		Expect(err).NotTo(HaveOccurred())
 	})
 
-	// Requires the len & num GET parameters, e.g. /uploadform?len=100&num=1
+	// Requires the len & num GET parameters, e.g. /uploadtest?len=100&num=1
 	http.HandleFunc("/uploadtest", func(w http.ResponseWriter, r *http.Request) {
 		defer GinkgoRecover()
 		response := uploadHTML
+		response = strings.Replace(response, "LENGTH", r.URL.Query().Get("len"), -1)
+		response = strings.Replace(response, "NUM", r.URL.Query().Get("num"), -1)
+		_, err := io.WriteString(w, response)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	// Requires the len & num GET parameters, e.g. /downloadtest?len=100&num=1
+	http.HandleFunc("/downloadtest", func(w http.ResponseWriter, r *http.Request) {
+		defer GinkgoRecover()
+		response := downloadHTML
 		response = strings.Replace(response, "LENGTH", r.URL.Query().Get("len"), -1)
 		response = strings.Replace(response, "NUM", r.URL.Query().Get("num"), -1)
 		_, err := io.WriteString(w, response)
@@ -183,72 +180,62 @@ func setupQuicServer() {
 	}()
 }
 
-// getDownloadSize gets the file size of a file in the local download folder
-func getDownloadSize(filename string) int {
-	stat, err := os.Stat(downloadDir + filename)
-	if err != nil {
-		return 0
-	}
-	return int(stat.Size())
+const prngJS = `
+var buf = new ArrayBuffer(LENGTH);
+var prng = new Uint8Array(buf);
+var seed = 1;
+for (var i = 0; i < LENGTH; i++) {
+	// https://en.wikipedia.org/wiki/Lehmer_random_number_generator
+	seed = seed * 48271 % 2147483647;
+	prng[i] = seed;
 }
-
-// getDownloadMD5 gets the md5 sum file of a file in the local download folder
-func getDownloadMD5(filename string) []byte {
-	return getFileMD5(filepath.Join(downloadDir, filename))
-}
-
-func getFileMD5(filename string) []byte {
-	var result []byte
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil
-	}
-	defer file.Close()
-
-	hash := md5.New()
-	_, err = io.Copy(hash, file)
-	if err != nil {
-		return nil
-	}
-	return hash.Sum(result)
-}
-
-func getRandomDlName() string {
-	return dlDataPrefix + strconv.Itoa(time.Now().Nanosecond())
-}
-
-func removeDownloadData() {
-	pattern := downloadDir + dlDataPrefix + "*"
-	if len(pattern) < 10 || !strings.Contains(pattern, "quic-go") {
-		panic("DL dir looks weird: " + pattern)
-	}
-	paths, err := filepath.Glob(pattern)
-	Expect(err).NotTo(HaveOccurred())
-	if len(paths) > 2 {
-		panic("warning: would have deleted too many files, pattern " + pattern)
-	}
-	for _, path := range paths {
-		err = os.Remove(path)
-		Expect(err).NotTo(HaveOccurred())
-	}
-}
+`
 
 const uploadHTML = `
 <html>
 <body>
 <script>
-  var buf = new ArrayBuffer(LENGTH);
-  var arr = new Uint8Array(buf);
-  var seed = 1;
-  for (var i = 0; i < LENGTH; i++) {
-    // https://en.wikipedia.org/wiki/Lehmer_random_number_generator
-    seed = seed * 48271 % 2147483647;
-    arr[i] = seed;
-  }
+  ` + prngJS + `
 	for (var i = 0; i < NUM; i++) {
 		var req = new XMLHttpRequest();
 		req.open("POST", "/uploadhandler?len=" + LENGTH, true);
 		req.send(buf);
+	}
+</script>
+</body>
+</html>
+`
+
+const downloadHTML = `
+<html>
+<body>
+<script>
+	` + prngJS + `
+
+	function verify(data) {
+		if (data.length !== LENGTH) return false;
+		for (var i = 0; i < LENGTH; i++) {
+			if (data[i] !== prng[i]) return false;
+		}
+		return true;
+	}
+
+	var nOK = 0;
+	for (var i = 0; i < NUM; i++) {
+		let req = new XMLHttpRequest();
+		req.responseType = "arraybuffer";
+		req.open("POST", "/prdata?len=" + LENGTH, true);
+		req.onreadystatechange = function () {
+			if (req.readyState === XMLHttpRequest.DONE && req.status === 200) {
+				if (verify(new Uint8Array(req.response))) {
+					nOK++;
+					if (nOK === NUM) {
+						document.write("dltest ok");
+					}
+				}
+			}
+		};
+		req.send();
 	}
 </script>
 </body>
