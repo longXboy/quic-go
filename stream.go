@@ -50,6 +50,7 @@ type stream struct {
 	finSent        utils.AtomicBool
 	rstSent        utils.AtomicBool
 	writeChan      chan struct{}
+	writeDeadline  time.Time
 
 	flowControlManager flowcontrol.FlowControlManager
 }
@@ -190,14 +191,36 @@ func (s *stream) Write(p []byte) (int, error) {
 	s.onData()
 	s.mutex.Unlock()
 
+	var err error
 	for {
+		s.mutex.Lock()
+		deadline := s.writeDeadline
+		s.mutex.Unlock()
+
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			err = errDeadline
+			break
+		}
+
 		s.mutex.Lock()
 		if s.dataForWriting == nil || s.err != nil {
 			s.mutex.Unlock()
 			break
 		}
 		s.mutex.Unlock()
-		<-s.writeChan
+
+		if deadline.IsZero() {
+			<-s.writeChan
+		} else {
+			select {
+			case <-s.writeChan:
+			case <-time.After(deadline.Sub(time.Now())):
+			}
+		}
+	}
+
+	if err != nil {
+		return 0, err
 	}
 
 	s.mutex.Lock()
@@ -308,6 +331,17 @@ func (s *stream) SetReadDeadline(t time.Time) error {
 	// if the new deadline is before the currently set deadline, wake up Read()
 	if t.Before(oldDeadline) {
 		s.signalRead()
+	}
+	return nil
+}
+
+func (s *stream) SetWriteDeadline(t time.Time) error {
+	s.mutex.Lock()
+	oldDeadline := s.writeDeadline
+	s.writeDeadline = t
+	s.mutex.Unlock()
+	if t.Before(oldDeadline) {
+		s.signalWrite()
 	}
 	return nil
 }
