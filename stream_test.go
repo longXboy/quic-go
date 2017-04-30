@@ -298,6 +298,18 @@ var _ = Describe("Stream", func() {
 				Expect(err).To(MatchError(errDeadline))
 				Expect(time.Now()).To(BeTemporally("~", deadline2, 25*time.Millisecond))
 			})
+
+			It("sets a read deadline, when SetDeadline is called", func() {
+				mockFcm.EXPECT().UpdateHighestReceived(streamID, protocol.ByteCount(6)).AnyTimes()
+				f := &frames.StreamFrame{Data: []byte("foobar")}
+				err := str.AddStreamFrame(f)
+				Expect(err).ToNot(HaveOccurred())
+				str.SetDeadline(time.Now().Add(-time.Second))
+				b := make([]byte, 6)
+				n, err := str.Read(b)
+				Expect(err).To(MatchError(errDeadline))
+				Expect(n).To(BeZero())
+			})
 		})
 
 		Context("closing", func() {
@@ -796,6 +808,13 @@ var _ = Describe("Stream", func() {
 				_, err := str.Write([]byte("foobar"))
 				Expect(err).To(MatchError(errDeadline))
 				Expect(time.Now()).To(BeTemporally("~", deadline2, 25*time.Millisecond))
+			})
+
+			It("sets a read deadline, when SetDeadline is called", func() {
+				str.SetDeadline(time.Now().Add(-time.Second))
+				n, err := str.Write([]byte("foobar"))
+				Expect(err).To(MatchError(errDeadline))
+				Expect(n).To(BeZero())
 			})
 		})
 
